@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-Monitor Lithos NISP - apenas alertas no Telegram
-Checa a cada 60 segundos e avisa mudanças de estado.
+Monitor Lithos NISP + novos blocos + block candidates
+Contagem diária de blocos do pool (reseta às 00:00 UTC) com persistência.
 """
 
 import os
 import time
 import logging
-from typing import Optional, Dict, Any
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, Dict, Any, List
 
 import requests
 
@@ -26,6 +29,9 @@ BLOCKS_CRITICAL = int(os.getenv("BLOCKS_CRITICAL", "15"))
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# Arquivo de persistência
+STATE_FILE = Path(os.getenv("STATE_FILE", "lithos_state.json"))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -33,11 +39,46 @@ logging.basicConfig(
 )
 log = logging.getLogger("lithos-monitor")
 
-# Estado anterior para detectar mudanças
+# Estado anterior
 last_state = {
     "held": None,
     "critical": None,
+    "max_block_height": None,
+    "block_candidates": None,
+    "daily_blocks": 0,
+    "current_utc_date": None,
 }
+
+# ==================== PERSISTÊNCIA ====================
+def load_state():
+    """Carrega o estado diário do arquivo, se existir e for do dia atual."""
+    global last_state
+    if not STATE_FILE.exists():
+        return
+    try:
+        data = json.loads(STATE_FILE.read_text())
+        today = get_utc_date()
+        if data.get("current_utc_date") == today:
+            last_state["daily_blocks"] = data.get("daily_blocks", 0)
+            last_state["current_utc_date"] = today
+            last_state["max_block_height"] = data.get("max_block_height")
+            log.info(f"Estado carregado: {last_state['daily_blocks']} blocos hoje (UTC)")
+        else:
+            log.info("Arquivo de estado é de outro dia. Contador zerado.")
+    except Exception as e:
+        log.warning(f"Não foi possível carregar estado: {e}")
+
+def save_state():
+    """Salva o estado diário no arquivo."""
+    try:
+        data = {
+            "current_utc_date": last_state["current_utc_date"],
+            "daily_blocks": last_state["daily_blocks"],
+            "max_block_height": last_state["max_block_height"],
+        }
+        STATE_FILE.write_text(json.dumps(data))
+    except Exception as e:
+        log.warning(f"Não foi possível salvar estado: {e}")
 
 # ==================== TELEGRAM ====================
 def send_telegram(message: str):
@@ -57,45 +98,74 @@ def send_telegram(message: str):
     except Exception as e:
         log.error(f"Falha ao enviar Telegram: {e}")
 
-# ==================== LITHOS ====================
-def get_nisp_status() -> Optional[Dict[str, Any]]:
-    url = f"{LITHOS_BASE}/stats/mining/workers"
+# ==================== LITHOS API ====================
+def _headers() -> Dict[str, str]:
     headers = {}
     if LITHOS_API_KEY:
         headers["X-Api-Key"] = LITHOS_API_KEY
+    return headers
 
+def get_nisp_status() -> Optional[Dict[str, Any]]:
+    """GET /stats/mining/workers"""
+    url = f"{LITHOS_BASE}/stats/mining/workers"
     try:
-        resp = requests.get(url, headers=headers, timeout=10, verify=False)
+        resp = requests.get(url, headers=_headers(), timeout=10, verify=False)
         resp.raise_for_status()
         data = resp.json()
         nisp = data.get("nisp")
         if not nisp:
-            log.warning("Resposta sem objeto 'nisp'")
             return None
-
         return {
             "held": nisp.get("held", False),
             "blocks_remaining": nisp.get("blocksRemaining"),
             "super_shares": nisp.get("superSharesInWindow", 0),
             "required": nisp.get("required", 10),
-            "valid_through": nisp.get("validThroughHeight"),
+            "block_candidates": data.get("blockCandidates", 0),
         }
     except Exception as e:
-        log.error(f"Erro ao consultar Lithos: {e}")
+        log.error(f"Erro ao consultar /stats/mining/workers: {e}")
         return None
+
+def get_pool_blocks() -> Optional[List[Dict[str, Any]]]:
+    """GET /blocks/all"""
+    url = f"{LITHOS_BASE}/blocks/all"
+    try:
+        resp = requests.get(url, headers=_headers(), timeout=10, verify=False)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        log.error(f"Erro ao consultar /blocks/all: {e}")
+        return None
+
+def get_utc_date() -> str:
+    """Retorna a data UTC atual no formato YYYY-MM-DD"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 # ==================== LOOP ====================
 def main():
     global last_state
 
-    log.info("Iniciando monitor Lithos NISP")
-    send_telegram("🟢 <b>Monitor Lithos iniciado</b>\nChecando NISP a cada 60s")
+    load_state()
+
+    log.info("Iniciando monitor Lithos NISP + blocos (contagem diária UTC com persistência)")
+    send_telegram("🟢 <b>Monitor Lithos iniciado</b>\nChecando NISP, blocos do pool (diário UTC) e block candidates a cada 60s")
 
     while True:
         try:
+            # Reset diário à meia-noite UTC
+            today_utc = get_utc_date()
+            if last_state["current_utc_date"] != today_utc:
+                if last_state["current_utc_date"] is not None:
+                    log.info(f"Novo dia UTC ({today_utc}). Contador de blocos zerado.")
+                    send_telegram(f"📅 <b>Novo dia UTC</b>\nContador de blocos do pool zerado.")
+                last_state["current_utc_date"] = today_utc
+                last_state["daily_blocks"] = 0
+                save_state()
+
+            # --- NISP status ---
             nisp = get_nisp_status()
             if not nisp or nisp["blocks_remaining"] is None:
-                log.warning("Não foi possível obter status do Lithos")
+                log.warning("Não foi possível obter status NISP")
                 time.sleep(POLL_INTERVAL)
                 continue
 
@@ -103,17 +173,17 @@ def main():
             blocks = nisp["blocks_remaining"]
             shares = nisp["super_shares"]
             required = nisp["required"]
+            block_candidates = nisp["block_candidates"]
             is_critical = blocks < BLOCKS_CRITICAL
 
             log.info(
                 f"NISP | held={held} | shares={shares}/{required} | "
-                f"blocks={blocks} | critical={is_critical}"
+                f"blocks={blocks} | candidates={block_candidates} | daily={last_state['daily_blocks']}"
             )
 
-            # Detecta mudanças de estado
             alerts = []
 
-            # NISP caiu abaixo de 10
+            # NISP perdido
             if last_state["held"] is True and not held:
                 alerts.append(
                     f"🔴 <b>NISP PERDIDO</b>\n"
@@ -121,7 +191,7 @@ def main():
                     f"Blocos restantes: {blocks}"
                 )
 
-            # NISP voltou para 10
+            # NISP recuperado
             if last_state["held"] is False and held:
                 alerts.append(
                     f"🟢 <b>NISP RECUPERADO</b>\n"
@@ -129,7 +199,7 @@ def main():
                     f"Blocos restantes: {blocks}"
                 )
 
-            # Entrou em nível crítico de blocos
+            # Blocos críticos
             if last_state["critical"] is False and is_critical:
                 alerts.append(
                     f"⚠️ <b>BLOCOS CRÍTICOS</b>\n"
@@ -138,13 +208,41 @@ def main():
                     f"NISP: {'✅ READY' if held else '❌ NÃO READY'}"
                 )
 
-            # Saiu do nível crítico
+            # Blocos normalizados
             if last_state["critical"] is True and not is_critical:
                 alerts.append(
                     f"✅ <b>Blocos normalizados</b>\n"
                     f"Blocos restantes: {blocks}\n"
                     f"NISP: {'✅ READY' if held else '❌ NÃO READY'}"
                 )
+
+            # Block candidates aumentou
+            if last_state["block_candidates"] is not None and block_candidates > last_state["block_candidates"]:
+                delta = block_candidates - last_state["block_candidates"]
+                alerts.append(
+                    f"🎯 <b>BLOCK CANDIDATE ENCONTRADO</b>\n"
+                    f"Novos candidatos: <b>{delta}</b>\n"
+                    f"Total nesta sessão: {block_candidates}"
+                )
+
+            # --- Novos blocos no pool ---
+            pool_blocks = get_pool_blocks()
+            if pool_blocks:
+                heights = [b.get("blockHeight", 0) for b in pool_blocks if b.get("blockHeight")]
+                if heights:
+                    current_max = max(heights)
+                    if last_state["max_block_height"] is not None and current_max > last_state["max_block_height"]:
+                        new_count = sum(1 for h in heights if h > last_state["max_block_height"])
+                        last_state["daily_blocks"] += new_count
+                        save_state()
+                        alerts.append(
+                            f"⛏️ <b>NOVOS BLOCOS NO POOL</b>\n"
+                            f"Nesta checagem: <b>{new_count}</b>\n"
+                            f"Total hoje (UTC): <b>{last_state['daily_blocks']}</b>\n"
+                            f"Maior height: {current_max}"
+                        )
+                    last_state["max_block_height"] = current_max
+                    save_state()
 
             # Envia alertas
             for msg in alerts:
@@ -154,6 +252,7 @@ def main():
             # Atualiza estado
             last_state["held"] = held
             last_state["critical"] = is_critical
+            last_state["block_candidates"] = block_candidates
 
         except Exception as e:
             log.exception(f"Erro no ciclo: {e}")
