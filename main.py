@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
 Monitor Lithos NISP + novos blocos + block candidates
-Checa superSharesInWindow diretamente (em vez de held).
-Contagem diária de blocos do pool (reseta às 00:00 UTC) com persistência.
+Contagem diária + resumo às 00:01 UTC.
 """
 
 import os
 import time
 import logging
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -48,6 +47,7 @@ last_state = {
     "daily_blocks": 0,
     "current_utc_date": None,
     "initialized": False,
+    "last_summary_date": None,
 }
 
 # ==================== PERSISTÊNCIA ====================
@@ -62,9 +62,11 @@ def load_state():
             last_state["daily_blocks"] = data.get("daily_blocks", 0)
             last_state["current_utc_date"] = today
             last_state["max_block_height"] = data.get("max_block_height")
+            last_state["last_summary_date"] = data.get("last_summary_date")
             log.info(f"Estado carregado: {last_state['daily_blocks']} blocos hoje (UTC)")
         else:
             log.info("Arquivo de estado é de outro dia. Contador zerado.")
+            last_state["last_summary_date"] = data.get("last_summary_date")
     except Exception as e:
         log.warning(f"Não foi possível carregar estado: {e}")
 
@@ -74,6 +76,7 @@ def save_state():
             "current_utc_date": last_state["current_utc_date"],
             "daily_blocks": last_state["daily_blocks"],
             "max_block_height": last_state["max_block_height"],
+            "last_summary_date": last_state["last_summary_date"],
         }
         STATE_FILE.write_text(json.dumps(data))
     except Exception as e:
@@ -134,8 +137,75 @@ def get_pool_blocks() -> Optional[List[Dict[str, Any]]]:
         log.error(f"Erro ao consultar /blocks/all: {e}")
         return None
 
+def get_mining_buckets(from_ms: int, until_ms: int, interval: str = "day") -> Optional[Dict]:
+    """GET /stats/mining/buckets"""
+    url = f"{LITHOS_BASE}/stats/mining/buckets"
+    params = {"from": from_ms, "until": until_ms, "interval": interval}
+    try:
+        resp = requests.get(url, headers=_headers(), params=params, timeout=15, verify=False)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        log.error(f"Erro ao consultar /stats/mining/buckets: {e}")
+        return None
+
 def get_utc_date() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+def get_utc_midnight(days_ago: int = 0) -> datetime:
+    now = datetime.now(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight - timedelta(days=days_ago)
+
+def should_send_daily_summary() -> bool:
+    """Retorna True se for >= 00:01 UTC e ainda não enviou o resumo do dia anterior."""
+    now = datetime.now(timezone.utc)
+    if now.hour == 0 and now.minute >= 1:
+        yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        if last_state["last_summary_date"] != yesterday:
+            return True
+    return False
+
+def send_daily_summary():
+    """Envia resumo do dia anterior usando os buckets."""
+    yesterday_midnight = get_utc_midnight(days_ago=1)
+    today_midnight = get_utc_midnight(days_ago=0)
+    from_ms = int(yesterday_midnight.timestamp() * 1000)
+    until_ms = int(today_midnight.timestamp() * 1000)
+    date_str = yesterday_midnight.strftime("%Y-%m-%d")
+
+    log.info(f"Gerando resumo diário para {date_str}")
+
+    data = get_mining_buckets(from_ms, until_ms, "day")
+    if not data or not data.get("buckets"):
+        send_telegram(f"📅 <b>Resumo {date_str}</b>\nNão foi possível obter dados dos buckets.")
+        last_state["last_summary_date"] = date_str
+        save_state()
+        return
+
+    # Soma os totais do dia
+    protocol_blocks = 0
+    local_participation = 0
+    for bucket in data["buckets"]:
+        totals = bucket.get("totals", {})
+        protocol_blocks += int(totals.get("lithos.blocks", 0) or 0)
+        # Participação local aproximada via rollup submissions locais
+        local_participation += int(totals.get("rollup.submission.localCount", 0) or 0)
+
+    missed = max(0, protocol_blocks - local_participation)
+
+    msg = (
+        f"📊 <b>Resumo diário — {date_str} (UTC)</b>\n\n"
+        f"⛏️ Blocos minerados pelo protocolo: <b>{protocol_blocks}</b>\n"
+        f"🎯 Blocos em que o pool participou: <b>{local_participation}</b>\n"
+        f"❌ Blocos em que ficou de fora: <b>{missed}</b>\n\n"
+        f"Contador interno do script (blocos detectados): {last_state['daily_blocks']}"
+    )
+    send_telegram(msg)
+    log.info(f"Resumo enviado: protocolo={protocol_blocks}, local={local_participation}")
+
+    last_state["last_summary_date"] = date_str
+    save_state()
 
 # ==================== LOOP ====================
 def main():
@@ -143,11 +213,15 @@ def main():
 
     load_state()
 
-    log.info("Iniciando monitor Lithos NISP + blocos (por quantidade)")
-    send_telegram("🟢 <b>Monitor Lithos iniciado</b>\nChecando quantidade de NISP, blocos do pool (diário UTC) e block candidates a cada 60s")
+    log.info("Iniciando monitor Lithos NISP + blocos + resumo diário")
+    send_telegram("🟢 <b>Monitor Lithos iniciado</b>\nChecando NISP, blocos e resumo diário às 00:01 UTC")
 
     while True:
         try:
+            # Resumo diário às 00:01 UTC
+            if should_send_daily_summary():
+                send_daily_summary()
+
             today_utc = get_utc_date()
             if last_state["current_utc_date"] != today_utc:
                 if last_state["current_utc_date"] is not None:
@@ -177,7 +251,6 @@ def main():
 
             alerts = []
 
-            # Primeira checagem
             if not last_state["initialized"]:
                 if not is_ready:
                     alerts.append(
@@ -200,7 +273,6 @@ def main():
                 prev_count = last_state["nisp_count"]
                 prev_ready = prev_count is not None and prev_count >= required
 
-                # Caiu abaixo de 10
                 if prev_ready and not is_ready:
                     alerts.append(
                         f"🔴 <b>NISP CAIU ABAIXO DE {required}</b>\n"
@@ -208,14 +280,12 @@ def main():
                         f"Blocos restantes: {blocks}"
                     )
 
-                # Voltou a 10 ou mais
                 if not prev_ready and is_ready:
                     alerts.append(
                         f"🟢 <b>NISP RECUPERADO ({nisp_count}/{required})</b>\n"
                         f"Blocos restantes: {blocks}"
                     )
 
-                # Blocos críticos
                 if last_state["critical"] is False and is_critical:
                     alerts.append(
                         f"⚠️ <b>BLOCOS CRÍTICOS</b>\n"
@@ -223,7 +293,6 @@ def main():
                         f"Super shares: {nisp_count}/{required}"
                     )
 
-                # Blocos normalizados
                 if last_state["critical"] is True and not is_critical:
                     alerts.append(
                         f"✅ <b>Blocos normalizados</b>\n"
@@ -231,7 +300,6 @@ def main():
                         f"Super shares: {nisp_count}/{required}"
                     )
 
-                # Block candidates
                 if last_state["block_candidates"] is not None and block_candidates > last_state["block_candidates"]:
                     delta = block_candidates - last_state["block_candidates"]
                     alerts.append(
@@ -240,7 +308,7 @@ def main():
                         f"Total nesta sessão: {block_candidates}"
                     )
 
-            # --- Novos blocos no pool ---
+            # Novos blocos no pool
             pool_blocks = get_pool_blocks()
             if pool_blocks:
                 heights = [b.get("blockHeight", 0) for b in pool_blocks if b.get("blockHeight")]
@@ -259,12 +327,10 @@ def main():
                     last_state["max_block_height"] = current_max
                     save_state()
 
-            # Envia alertas
             for msg in alerts:
                 log.info(f"Enviando alerta: {msg[:80]}...")
                 send_telegram(msg)
 
-            # Atualiza estado
             last_state["nisp_count"] = nisp_count
             last_state["critical"] = is_critical
             last_state["block_candidates"] = block_candidates
