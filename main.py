@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Monitor Lithos NISP + novos blocos + block candidates
+Checa superSharesInWindow diretamente (em vez de held).
 Contagem diária de blocos do pool (reseta às 00:00 UTC) com persistência.
 """
 
@@ -25,11 +26,11 @@ if not LITHOS_API_KEY:
 
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 BLOCKS_CRITICAL = int(os.getenv("BLOCKS_CRITICAL", "15"))
+NISP_REQUIRED = int(os.getenv("NISP_REQUIRED", "10"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Arquivo de persistência
 STATE_FILE = Path(os.getenv("STATE_FILE", "lithos_state.json"))
 
 logging.basicConfig(
@@ -39,19 +40,18 @@ logging.basicConfig(
 )
 log = logging.getLogger("lithos-monitor")
 
-# Estado anterior
 last_state = {
-    "held": None,
+    "nisp_count": None,
     "critical": None,
     "max_block_height": None,
     "block_candidates": None,
     "daily_blocks": 0,
     "current_utc_date": None,
+    "initialized": False,
 }
 
 # ==================== PERSISTÊNCIA ====================
 def load_state():
-    """Carrega o estado diário do arquivo, se existir e for do dia atual."""
     global last_state
     if not STATE_FILE.exists():
         return
@@ -69,7 +69,6 @@ def load_state():
         log.warning(f"Não foi possível carregar estado: {e}")
 
 def save_state():
-    """Salva o estado diário no arquivo."""
     try:
         data = {
             "current_utc_date": last_state["current_utc_date"],
@@ -106,7 +105,6 @@ def _headers() -> Dict[str, str]:
     return headers
 
 def get_nisp_status() -> Optional[Dict[str, Any]]:
-    """GET /stats/mining/workers"""
     url = f"{LITHOS_BASE}/stats/mining/workers"
     try:
         resp = requests.get(url, headers=_headers(), timeout=10, verify=False)
@@ -116,10 +114,10 @@ def get_nisp_status() -> Optional[Dict[str, Any]]:
         if not nisp:
             return None
         return {
-            "held": nisp.get("held", False),
+            "nisp_count": nisp.get("superSharesInWindow", 0),
+            "required": nisp.get("required", NISP_REQUIRED),
             "blocks_remaining": nisp.get("blocksRemaining"),
-            "super_shares": nisp.get("superSharesInWindow", 0),
-            "required": nisp.get("required", 10),
+            "held": nisp.get("held", False),
             "block_candidates": data.get("blockCandidates", 0),
         }
     except Exception as e:
@@ -127,7 +125,6 @@ def get_nisp_status() -> Optional[Dict[str, Any]]:
         return None
 
 def get_pool_blocks() -> Optional[List[Dict[str, Any]]]:
-    """GET /blocks/all"""
     url = f"{LITHOS_BASE}/blocks/all"
     try:
         resp = requests.get(url, headers=_headers(), timeout=10, verify=False)
@@ -138,7 +135,6 @@ def get_pool_blocks() -> Optional[List[Dict[str, Any]]]:
         return None
 
 def get_utc_date() -> str:
-    """Retorna a data UTC atual no formato YYYY-MM-DD"""
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 # ==================== LOOP ====================
@@ -147,83 +143,102 @@ def main():
 
     load_state()
 
-    log.info("Iniciando monitor Lithos NISP + blocos (contagem diária UTC com persistência)")
-    send_telegram("🟢 <b>Monitor Lithos iniciado</b>\nChecando NISP, blocos do pool (diário UTC) e block candidates a cada 60s")
+    log.info("Iniciando monitor Lithos NISP + blocos (por quantidade)")
+    send_telegram("🟢 <b>Monitor Lithos iniciado</b>\nChecando quantidade de NISP, blocos do pool (diário UTC) e block candidates a cada 60s")
 
     while True:
         try:
-            # Reset diário à meia-noite UTC
             today_utc = get_utc_date()
             if last_state["current_utc_date"] != today_utc:
                 if last_state["current_utc_date"] is not None:
                     log.info(f"Novo dia UTC ({today_utc}). Contador de blocos zerado.")
-                    send_telegram(f"📅 <b>Novo dia UTC</b>\nContador de blocos do pool zerado.")
+                    send_telegram("📅 <b>Novo dia UTC</b>\nContador de blocos do pool zerado.")
                 last_state["current_utc_date"] = today_utc
                 last_state["daily_blocks"] = 0
                 save_state()
 
-            # --- NISP status ---
             nisp = get_nisp_status()
             if not nisp or nisp["blocks_remaining"] is None:
                 log.warning("Não foi possível obter status NISP")
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            held = nisp["held"]
-            blocks = nisp["blocks_remaining"]
-            shares = nisp["super_shares"]
+            nisp_count = nisp["nisp_count"]
             required = nisp["required"]
+            blocks = nisp["blocks_remaining"]
             block_candidates = nisp["block_candidates"]
+            is_ready = nisp_count >= required
             is_critical = blocks < BLOCKS_CRITICAL
 
             log.info(
-                f"NISP | held={held} | shares={shares}/{required} | "
+                f"NISP | count={nisp_count}/{required} | ready={is_ready} | "
                 f"blocks={blocks} | candidates={block_candidates} | daily={last_state['daily_blocks']}"
             )
 
             alerts = []
 
-            # NISP perdido
-            if last_state["held"] is True and not held:
-                alerts.append(
-                    f"🔴 <b>NISP PERDIDO</b>\n"
-                    f"Super shares: {shares}/{required}\n"
-                    f"Blocos restantes: {blocks}"
-                )
+            # Primeira checagem
+            if not last_state["initialized"]:
+                if not is_ready:
+                    alerts.append(
+                        f"🔴 <b>NISP ABAIXO DE {required} (início)</b>\n"
+                        f"Super shares: {nisp_count}/{required}\n"
+                        f"Blocos restantes: {blocks}"
+                    )
+                if is_critical:
+                    alerts.append(
+                        f"⚠️ <b>BLOCOS CRÍTICOS (início)</b>\n"
+                        f"Blocos restantes: <b>{blocks}</b>\n"
+                        f"Super shares: {nisp_count}/{required}"
+                    )
+                last_state["initialized"] = True
+                last_state["nisp_count"] = nisp_count
+                last_state["critical"] = is_critical
+                last_state["block_candidates"] = block_candidates
 
-            # NISP recuperado
-            if last_state["held"] is False and held:
-                alerts.append(
-                    f"🟢 <b>NISP RECUPERADO</b>\n"
-                    f"Super shares: {shares}/{required}\n"
-                    f"Blocos restantes: {blocks}"
-                )
+            else:
+                prev_count = last_state["nisp_count"]
+                prev_ready = prev_count is not None and prev_count >= required
 
-            # Blocos críticos
-            if last_state["critical"] is False and is_critical:
-                alerts.append(
-                    f"⚠️ <b>BLOCOS CRÍTICOS</b>\n"
-                    f"Blocos restantes: <b>{blocks}</b> (threshold: {BLOCKS_CRITICAL})\n"
-                    f"Super shares: {shares}/{required}\n"
-                    f"NISP: {'✅ READY' if held else '❌ NÃO READY'}"
-                )
+                # Caiu abaixo de 10
+                if prev_ready and not is_ready:
+                    alerts.append(
+                        f"🔴 <b>NISP CAIU ABAIXO DE {required}</b>\n"
+                        f"Super shares: {nisp_count}/{required}\n"
+                        f"Blocos restantes: {blocks}"
+                    )
 
-            # Blocos normalizados
-            if last_state["critical"] is True and not is_critical:
-                alerts.append(
-                    f"✅ <b>Blocos normalizados</b>\n"
-                    f"Blocos restantes: {blocks}\n"
-                    f"NISP: {'✅ READY' if held else '❌ NÃO READY'}"
-                )
+                # Voltou a 10 ou mais
+                if not prev_ready and is_ready:
+                    alerts.append(
+                        f"🟢 <b>NISP RECUPERADO ({nisp_count}/{required})</b>\n"
+                        f"Blocos restantes: {blocks}"
+                    )
 
-            # Block candidates aumentou
-            if last_state["block_candidates"] is not None and block_candidates > last_state["block_candidates"]:
-                delta = block_candidates - last_state["block_candidates"]
-                alerts.append(
-                    f"🎯 <b>BLOCK CANDIDATE ENCONTRADO</b>\n"
-                    f"Novos candidatos: <b>{delta}</b>\n"
-                    f"Total nesta sessão: {block_candidates}"
-                )
+                # Blocos críticos
+                if last_state["critical"] is False and is_critical:
+                    alerts.append(
+                        f"⚠️ <b>BLOCOS CRÍTICOS</b>\n"
+                        f"Blocos restantes: <b>{blocks}</b> (threshold: {BLOCKS_CRITICAL})\n"
+                        f"Super shares: {nisp_count}/{required}"
+                    )
+
+                # Blocos normalizados
+                if last_state["critical"] is True and not is_critical:
+                    alerts.append(
+                        f"✅ <b>Blocos normalizados</b>\n"
+                        f"Blocos restantes: {blocks}\n"
+                        f"Super shares: {nisp_count}/{required}"
+                    )
+
+                # Block candidates
+                if last_state["block_candidates"] is not None and block_candidates > last_state["block_candidates"]:
+                    delta = block_candidates - last_state["block_candidates"]
+                    alerts.append(
+                        f"🎯 <b>BLOCK CANDIDATE ENCONTRADO</b>\n"
+                        f"Novos candidatos: <b>{delta}</b>\n"
+                        f"Total nesta sessão: {block_candidates}"
+                    )
 
             # --- Novos blocos no pool ---
             pool_blocks = get_pool_blocks()
@@ -250,7 +265,7 @@ def main():
                 send_telegram(msg)
 
             # Atualiza estado
-            last_state["held"] = held
+            last_state["nisp_count"] = nisp_count
             last_state["critical"] = is_critical
             last_state["block_candidates"] = block_candidates
 
