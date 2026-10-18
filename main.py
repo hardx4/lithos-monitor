@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Monitor Lithos NISP + novos blocos + block candidates
-Contagem diária + resumo às 00:01 UTC.
+Total diário oficial via /stats/mining/buckets (lithos.blocks).
+Resumo diário às 00:01 UTC.
 """
 
 import os
@@ -44,10 +45,10 @@ last_state = {
     "critical": None,
     "max_block_height": None,
     "block_candidates": None,
-    "daily_blocks": 0,
     "current_utc_date": None,
     "initialized": False,
     "last_summary_date": None,
+    "last_official_daily": 0,
 }
 
 # ==================== PERSISTÊNCIA ====================
@@ -59,13 +60,13 @@ def load_state():
         data = json.loads(STATE_FILE.read_text())
         today = get_utc_date()
         if data.get("current_utc_date") == today:
-            last_state["daily_blocks"] = data.get("daily_blocks", 0)
             last_state["current_utc_date"] = today
             last_state["max_block_height"] = data.get("max_block_height")
             last_state["last_summary_date"] = data.get("last_summary_date")
-            log.info(f"Estado carregado: {last_state['daily_blocks']} blocos hoje (UTC)")
+            last_state["last_official_daily"] = data.get("last_official_daily", 0)
+            log.info(f"Estado carregado. Último total oficial: {last_state['last_official_daily']}")
         else:
-            log.info("Arquivo de estado é de outro dia. Contador zerado.")
+            log.info("Arquivo de estado é de outro dia.")
             last_state["last_summary_date"] = data.get("last_summary_date")
     except Exception as e:
         log.warning(f"Não foi possível carregar estado: {e}")
@@ -74,9 +75,9 @@ def save_state():
     try:
         data = {
             "current_utc_date": last_state["current_utc_date"],
-            "daily_blocks": last_state["daily_blocks"],
             "max_block_height": last_state["max_block_height"],
             "last_summary_date": last_state["last_summary_date"],
+            "last_official_daily": last_state["last_official_daily"],
         }
         STATE_FILE.write_text(json.dumps(data))
     except Exception as e:
@@ -138,7 +139,6 @@ def get_pool_blocks() -> Optional[List[Dict[str, Any]]]:
         return None
 
 def get_mining_buckets(from_ms: int, until_ms: int, interval: str = "day") -> Optional[Dict]:
-    """GET /stats/mining/buckets"""
     url = f"{LITHOS_BASE}/stats/mining/buckets"
     params = {"from": from_ms, "until": until_ms, "interval": interval}
     try:
@@ -157,8 +157,21 @@ def get_utc_midnight(days_ago: int = 0) -> datetime:
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight - timedelta(days=days_ago)
 
+def get_official_daily_blocks() -> int:
+    """Retorna lithos.blocks do dia UTC atual via buckets."""
+    today_midnight = get_utc_midnight(0)
+    next_midnight = today_midnight + timedelta(days=1)
+    from_ms = int(today_midnight.timestamp() * 1000)
+    until_ms = int(next_midnight.timestamp() * 1000)
+    data = get_mining_buckets(from_ms, until_ms, "day")
+    if not data or not data.get("buckets"):
+        return last_state["last_official_daily"]
+    totals = data["buckets"][0].get("totals", {})
+    count = int(totals.get("lithos.blocks", 0) or 0)
+    last_state["last_official_daily"] = count
+    return count
+
 def should_send_daily_summary() -> bool:
-    """Retorna True se for >= 00:01 UTC e ainda não enviou o resumo do dia anterior."""
     now = datetime.now(timezone.utc)
     if now.hour == 0 and now.minute >= 1:
         yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -167,9 +180,8 @@ def should_send_daily_summary() -> bool:
     return False
 
 def send_daily_summary():
-    """Envia resumo do dia anterior usando os buckets."""
-    yesterday_midnight = get_utc_midnight(days_ago=1)
-    today_midnight = get_utc_midnight(days_ago=0)
+    yesterday_midnight = get_utc_midnight(1)
+    today_midnight = get_utc_midnight(0)
     from_ms = int(yesterday_midnight.timestamp() * 1000)
     until_ms = int(today_midnight.timestamp() * 1000)
     date_str = yesterday_midnight.strftime("%Y-%m-%d")
@@ -183,23 +195,16 @@ def send_daily_summary():
         save_state()
         return
 
-    # Soma os totais do dia
-    protocol_blocks = 0
-    local_participation = 0
-    for bucket in data["buckets"]:
-        totals = bucket.get("totals", {})
-        protocol_blocks += int(totals.get("lithos.blocks", 0) or 0)
-        # Participação local aproximada via rollup submissions locais
-        local_participation += int(totals.get("rollup.submission.localCount", 0) or 0)
-
+    totals = data["buckets"][0].get("totals", {})
+    protocol_blocks = int(totals.get("lithos.blocks", 0) or 0)
+    local_participation = int(totals.get("rollup.submission.localCount", 0) or 0)
     missed = max(0, protocol_blocks - local_participation)
 
     msg = (
         f"📊 <b>Resumo diário — {date_str} (UTC)</b>\n\n"
         f"⛏️ Blocos minerados pelo protocolo: <b>{protocol_blocks}</b>\n"
         f"🎯 Blocos em que o pool participou: <b>{local_participation}</b>\n"
-        f"❌ Blocos em que ficou de fora: <b>{missed}</b>\n\n"
-        f"Contador interno do script (blocos detectados): {last_state['daily_blocks']}"
+        f"❌ Blocos em que ficou de fora: <b>{missed}</b>"
     )
     send_telegram(msg)
     log.info(f"Resumo enviado: protocolo={protocol_blocks}, local={local_participation}")
@@ -213,22 +218,21 @@ def main():
 
     load_state()
 
-    log.info("Iniciando monitor Lithos NISP + blocos + resumo diário")
-    send_telegram("🟢 <b>Monitor Lithos iniciado</b>\nChecando NISP, blocos e resumo diário às 00:01 UTC")
+    log.info("Iniciando monitor Lithos NISP + blocos (total oficial via buckets)")
+    send_telegram("🟢 <b>Monitor Lithos iniciado</b>\nTotal diário oficial via buckets")
 
     while True:
         try:
-            # Resumo diário às 00:01 UTC
             if should_send_daily_summary():
                 send_daily_summary()
 
             today_utc = get_utc_date()
             if last_state["current_utc_date"] != today_utc:
                 if last_state["current_utc_date"] is not None:
-                    log.info(f"Novo dia UTC ({today_utc}). Contador de blocos zerado.")
-                    send_telegram("📅 <b>Novo dia UTC</b>\nContador de blocos do pool zerado.")
+                    log.info(f"Novo dia UTC ({today_utc}).")
+                    send_telegram("📅 <b>Novo dia UTC</b>")
                 last_state["current_utc_date"] = today_utc
-                last_state["daily_blocks"] = 0
+                last_state["last_official_daily"] = 0
                 save_state()
 
             nisp = get_nisp_status()
@@ -246,7 +250,7 @@ def main():
 
             log.info(
                 f"NISP | count={nisp_count}/{required} | ready={is_ready} | "
-                f"blocks={blocks} | candidates={block_candidates} | daily={last_state['daily_blocks']}"
+                f"blocks={blocks} | candidates={block_candidates}"
             )
 
             alerts = []
@@ -308,7 +312,7 @@ def main():
                         f"Total nesta sessão: {block_candidates}"
                     )
 
-            # Novos blocos no pool
+            # Novos blocos no pool (alerta por height, total oficial via buckets)
             pool_blocks = get_pool_blocks()
             if pool_blocks:
                 heights = [b.get("blockHeight", 0) for b in pool_blocks if b.get("blockHeight")]
@@ -316,12 +320,12 @@ def main():
                     current_max = max(heights)
                     if last_state["max_block_height"] is not None and current_max > last_state["max_block_height"]:
                         new_count = sum(1 for h in heights if h > last_state["max_block_height"])
-                        last_state["daily_blocks"] += new_count
+                        official_daily = get_official_daily_blocks()
                         save_state()
                         alerts.append(
                             f"⛏️ <b>NOVOS BLOCOS NO POOL</b>\n"
                             f"Nesta checagem: <b>{new_count}</b>\n"
-                            f"Total hoje (UTC): <b>{last_state['daily_blocks']}</b>\n"
+                            f"Total hoje (UTC): <b>{official_daily}</b>\n"
                             f"Maior height: {current_max}"
                         )
                     last_state["max_block_height"] = current_max
