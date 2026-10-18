@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Monitor Lithos NISP + novos blocos + block candidates
-Total diário oficial via /stats/mining/buckets (lithos.blocks).
+- Total protocolo: lithos.blocks (buckets)
+- Participação do pool: heights novas em /blocks/all (set persistido)
 Resumo diário às 00:01 UTC.
 """
 
@@ -11,7 +12,7 @@ import logging
 import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Set
 
 import requests
 
@@ -44,6 +45,7 @@ last_state = {
     "nisp_count": None,
     "critical": None,
     "max_block_height": None,
+    "seen_heights": set(),          # heights já contadas hoje
     "block_candidates": None,
     "current_utc_date": None,
     "initialized": False,
@@ -62,11 +64,12 @@ def load_state():
         if data.get("current_utc_date") == today:
             last_state["current_utc_date"] = today
             last_state["max_block_height"] = data.get("max_block_height")
+            last_state["seen_heights"] = set(data.get("seen_heights", []))
             last_state["last_summary_date"] = data.get("last_summary_date")
             last_state["last_official_daily"] = data.get("last_official_daily", 0)
-            log.info(f"Estado carregado. Último total oficial: {last_state['last_official_daily']}")
+            log.info(f"Estado carregado. Heights vistas hoje: {len(last_state['seen_heights'])}")
         else:
-            log.info("Arquivo de estado é de outro dia.")
+            log.info("Arquivo de estado é de outro dia. Set de heights zerado.")
             last_state["last_summary_date"] = data.get("last_summary_date")
     except Exception as e:
         log.warning(f"Não foi possível carregar estado: {e}")
@@ -76,6 +79,7 @@ def save_state():
         data = {
             "current_utc_date": last_state["current_utc_date"],
             "max_block_height": last_state["max_block_height"],
+            "seen_heights": list(last_state["seen_heights"]),
             "last_summary_date": last_state["last_summary_date"],
             "last_official_daily": last_state["last_official_daily"],
         }
@@ -158,7 +162,7 @@ def get_utc_midnight(days_ago: int = 0) -> datetime:
     return midnight - timedelta(days=days_ago)
 
 def get_official_daily_blocks() -> int:
-    """Retorna lithos.blocks do dia UTC atual via buckets."""
+    """lithos.blocks do dia UTC atual."""
     today_midnight = get_utc_midnight(0)
     next_midnight = today_midnight + timedelta(days=1)
     from_ms = int(today_midnight.timestamp() * 1000)
@@ -218,8 +222,8 @@ def main():
 
     load_state()
 
-    log.info("Iniciando monitor Lithos NISP + blocos (total oficial via buckets)")
-    send_telegram("🟢 <b>Monitor Lithos iniciado</b>\nTotal diário oficial via buckets")
+    log.info("Iniciando monitor Lithos (total protocolo + participação por heights)")
+    send_telegram("🟢 <b>Monitor Lithos iniciado</b>\nTotal protocolo (buckets) + participação (heights)")
 
     while True:
         try:
@@ -229,9 +233,10 @@ def main():
             today_utc = get_utc_date()
             if last_state["current_utc_date"] != today_utc:
                 if last_state["current_utc_date"] is not None:
-                    log.info(f"Novo dia UTC ({today_utc}).")
-                    send_telegram("📅 <b>Novo dia UTC</b>")
+                    log.info(f"Novo dia UTC ({today_utc}). Set de heights zerado.")
+                    send_telegram("📅 <b>Novo dia UTC</b>\nContadores de participação zerados.")
                 last_state["current_utc_date"] = today_utc
+                last_state["seen_heights"] = set()
                 last_state["last_official_daily"] = 0
                 save_state()
 
@@ -250,7 +255,8 @@ def main():
 
             log.info(
                 f"NISP | count={nisp_count}/{required} | ready={is_ready} | "
-                f"blocks={blocks} | candidates={block_candidates}"
+                f"blocks={blocks} | candidates={block_candidates} | "
+                f"participated={len(last_state['seen_heights'])}"
             )
 
             alerts = []
@@ -312,24 +318,28 @@ def main():
                         f"Total nesta sessão: {block_candidates}"
                     )
 
-            # Novos blocos no pool (alerta por height, total oficial via buckets)
+            # --- Participação via heights novas em /blocks/all ---
             pool_blocks = get_pool_blocks()
             if pool_blocks:
-                heights = [b.get("blockHeight", 0) for b in pool_blocks if b.get("blockHeight")]
-                if heights:
-                    current_max = max(heights)
-                    if last_state["max_block_height"] is not None and current_max > last_state["max_block_height"]:
-                        new_count = sum(1 for h in heights if h > last_state["max_block_height"])
-                        official_daily = get_official_daily_blocks()
-                        save_state()
-                        alerts.append(
-                            f"⛏️ <b>NOVOS BLOCOS NO POOL</b>\n"
-                            f"Nesta checagem: <b>{new_count}</b>\n"
-                            f"Total hoje (UTC): <b>{official_daily}</b>\n"
-                            f"Maior height: {current_max}"
-                        )
-                    last_state["max_block_height"] = current_max
+                current_heights = {b.get("blockHeight") for b in pool_blocks if b.get("blockHeight")}
+                new_heights = current_heights - last_state["seen_heights"]
+
+                if new_heights:
+                    official_daily = get_official_daily_blocks()
+                    last_state["seen_heights"].update(new_heights)
+                    participated = len(last_state["seen_heights"])
                     save_state()
+
+                    alerts.append(
+                        f"⛏️ <b>NOVOS BLOCOS NO POOL</b>\n"
+                        f"Novos nesta checagem: <b>{len(new_heights)}</b>\n"
+                        f"Protocolo hoje: <b>{official_daily}</b>\n"
+                        f"Pool participou: <b>{participated}</b>\n"
+                        f"Ficou de fora: <b>{max(0, official_daily - participated)}</b>"
+                    )
+
+                if current_heights:
+                    last_state["max_block_height"] = max(current_heights)
 
             for msg in alerts:
                 log.info(f"Enviando alerta: {msg[:80]}...")
