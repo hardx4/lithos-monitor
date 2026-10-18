@@ -3,6 +3,7 @@
 Monitor Lithos NISP + novos blocos + block candidates
 - Total protocolo: lithos.blocks (buckets)
 - Participação do pool: heights novas em /blocks/all (set persistido)
+- Lista as heights na notificação
 Resumo diário às 00:01 UTC.
 """
 
@@ -45,7 +46,7 @@ last_state = {
     "nisp_count": None,
     "critical": None,
     "max_block_height": None,
-    "seen_heights": set(),          # heights já contadas hoje
+    "seen_heights": set(),
     "block_candidates": None,
     "current_utc_date": None,
     "initialized": False,
@@ -330,9 +331,11 @@ def main():
                     participated = len(last_state["seen_heights"])
                     save_state()
 
+                    heights_list = ", ".join(str(h) for h in sorted(new_heights))
                     alerts.append(
                         f"⛏️ <b>NOVOS BLOCOS NO POOL</b>\n"
                         f"Novos nesta checagem: <b>{len(new_heights)}</b>\n"
+                        f"Heights: <code>{heights_list}</code>\n"
                         f"Protocolo hoje: <b>{official_daily}</b>\n"
                         f"Pool participou: <b>{participated}</b>\n"
                         f"Ficou de fora: <b>{max(0, official_daily - participated)}</b>"
