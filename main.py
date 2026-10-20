@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Monitor Lithos NISP + NiceHash marketplace
+- Alertas de blocos <15, <10 e <5
 - Total protocolo + participação por heights
 - Block candidates (aceito/rejeitado)
 - Resumo diário com rollupScore
-- Monitor de preço NiceHash (subir/baixar) com fix do top_other
+- Monitor de preço NiceHash (subir/baixar)
 """
 
 import os
@@ -53,6 +54,8 @@ log = logging.getLogger("lithos-manager")
 last_state = {
     "nisp_count": None,
     "critical": None,
+    "critical_10": None,
+    "critical_5": None,
     "max_block_height": None,
     "seen_heights": set(),
     "block_candidates": None,
@@ -323,7 +326,6 @@ def monitor_nicehash_price():
     my_rigs = int(my_order.get("rigsCount", 0))
     my_speed = float(my_order.get("acceptedSpeed", 0))
 
-    # Ordens ativas com preço mais alto (excluindo a própria)
     higher_active = [
         o for o in orders
         if o.get("id") != NICEHASH_ORDER_ID
@@ -332,7 +334,6 @@ def monitor_nicehash_price():
         and float(o.get("acceptedSpeed", 0)) > 0.0001
     ]
 
-    # Maior preço ativo de *outras* ordens
     other_active_prices = [
         float(o["price"]) for o in orders
         if o.get("id") != NICEHASH_ORDER_ID and int(o.get("rigsCount", 0)) > 0
@@ -341,7 +342,6 @@ def monitor_nicehash_price():
 
     alerts = []
 
-    # Sem mineradores e existem ordens mais caras ativas → subir preço
     if my_rigs == 0 and my_speed < 0.0001 and higher_active:
         top_higher = max(float(o["price"]) for o in higher_active)
         alerts.append(
@@ -352,7 +352,6 @@ def monitor_nicehash_price():
             f"Rigs suas: {my_rigs} | Speed: {my_speed:.6f}"
         )
 
-    # Preço pode baixar (outras ordens estão bem abaixo e cooldown ok)
     now = time.time()
     if (now - last_state["last_price_decrease_alert"]) >= PRICE_DECREASE_COOLDOWN:
         if top_other > 0 and my_price > top_other + PRICE_DROP_THRESHOLD and my_rigs > 0:
@@ -431,6 +430,8 @@ def main():
                         f"Blocos restantes: <b>{blocks}</b>\n"
                         f"Super shares: {nisp_count}/{required}"
                     )
+                last_state["critical_10"] = blocks < 10
+                last_state["critical_5"] = blocks < 5
                 last_state["initialized"] = True
                 last_state["nisp_count"] = nisp_count
                 last_state["critical"] = is_critical
@@ -468,6 +469,31 @@ def main():
                         f"Blocos restantes: {blocks}\n"
                         f"Super shares: {nisp_count}/{required}"
                     )
+
+                # Alertas específicos <10 e <5
+                if last_state["critical_10"] is not True and blocks < 10:
+                    alerts.append(
+                        f"⚠️ <b>BLOCOS ABAIXO DE 10</b>\n"
+                        f"Blocos restantes: <b>{blocks}</b>\n"
+                        f"Super shares: {nisp_count}/{required}\n"
+                        f"NISP: {'✅ READY' if is_ready else '❌ NÃO READY'}"
+                    )
+                    last_state["critical_10"] = True
+
+                if last_state["critical_10"] is True and blocks >= 10:
+                    last_state["critical_10"] = False
+
+                if last_state["critical_5"] is not True and blocks < 5:
+                    alerts.append(
+                        f"🚨 <b>BLOCOS ABAIXO DE 5</b>\n"
+                        f"Blocos restantes: <b>{blocks}</b>\n"
+                        f"Super shares: {nisp_count}/{required}\n"
+                        f"NISP: {'✅ READY' if is_ready else '❌ NÃO READY'}"
+                    )
+                    last_state["critical_5"] = True
+
+                if last_state["critical_5"] is True and blocks >= 5:
+                    last_state["critical_5"] = False
 
                 if last_state["block_candidates"] is not None:
                     if block_candidates > last_state["block_candidates"]:
