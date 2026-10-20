@@ -2,15 +2,16 @@
 """
 Monitor Lithos NISP + novos blocos + block candidates
 - Total protocolo: lithos.blocks (buckets)
-- Participação do pool: heights novas em /blocks/all (set persistido)
-- Lista as heights na notificação
-Resumo diário às 00:01 UTC.
+- Participação: heights novas e recentes em /blocks/all
+- Block candidates: verifica aceitação/rejeição
+- Resumo diário com média/mediana de rollupScore (pagamentos + evaluation)
 """
 
 import os
 import time
 import logging
 import json
+import statistics
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Set
@@ -48,6 +49,8 @@ last_state = {
     "max_block_height": None,
     "seen_heights": set(),
     "block_candidates": None,
+    "solutions_accepted": None,
+    "solutions_rejected": None,
     "current_utc_date": None,
     "initialized": False,
     "last_summary_date": None,
@@ -128,6 +131,8 @@ def get_nisp_status() -> Optional[Dict[str, Any]]:
             "blocks_remaining": nisp.get("blocksRemaining"),
             "held": nisp.get("held", False),
             "block_candidates": data.get("blockCandidates", 0),
+            "solutions_accepted": data.get("solutionsAccepted", 0),
+            "solutions_rejected": data.get("solutionsRejected", 0),
         }
     except Exception as e:
         log.error(f"Erro ao consultar /stats/mining/workers: {e}")
@@ -154,6 +159,16 @@ def get_mining_buckets(from_ms: int, until_ms: int, interval: str = "day") -> Op
         log.error(f"Erro ao consultar /stats/mining/buckets: {e}")
         return None
 
+def get_payments() -> Optional[Dict]:
+    url = f"{LITHOS_BASE}/stats/mining/payments"
+    try:
+        resp = requests.get(url, headers=_headers(), timeout=15, verify=False)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        log.error(f"Erro ao consultar /stats/mining/payments: {e}")
+        return None
+
 def get_utc_date() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
@@ -163,7 +178,6 @@ def get_utc_midnight(days_ago: int = 0) -> datetime:
     return midnight - timedelta(days=days_ago)
 
 def get_official_daily_blocks() -> int:
-    """lithos.blocks do dia UTC atual."""
     today_midnight = get_utc_midnight(0)
     next_midnight = today_midnight + timedelta(days=1)
     from_ms = int(today_midnight.timestamp() * 1000)
@@ -184,6 +198,46 @@ def should_send_daily_summary() -> bool:
             return True
     return False
 
+def get_rollup_score_stats() -> Dict[str, Any]:
+    """Média e mediana do rollupScore dos pagamentos + claims em evaluation das últimas 24h."""
+    data = get_payments()
+    if not data:
+        return {}
+    
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    day_ago_ms = now_ms - 86400000
+    scores = []
+
+    # Pagamentos confirmados
+    for p in data.get("payments", []):
+        ts = p.get("timestamp") or p.get("minedTimestamp") or 0
+        if ts >= day_ago_ms and p.get("rollupScore"):
+            try:
+                scores.append(int(p["rollupScore"]))
+            except (ValueError, TypeError):
+                pass
+
+    # Claims em evaluation
+    for c in data.get("claims", []):
+        if c.get("phase") != "evaluation":
+            continue
+        ts = c.get("phaseTimestamp") or c.get("submittedTimestamp") or 0
+        if ts >= day_ago_ms and c.get("rollupScore"):
+            try:
+                scores.append(int(c["rollupScore"]))
+            except (ValueError, TypeError):
+                pass
+
+    if not scores:
+        return {"count": 0}
+    return {
+        "count": len(scores),
+        "mean": int(statistics.mean(scores)),
+        "median": int(statistics.median(scores)),
+        "min": min(scores),
+        "max": max(scores),
+    }
+
 def send_daily_summary():
     yesterday_midnight = get_utc_midnight(1)
     today_midnight = get_utc_midnight(0)
@@ -194,26 +248,34 @@ def send_daily_summary():
     log.info(f"Gerando resumo diário para {date_str}")
 
     data = get_mining_buckets(from_ms, until_ms, "day")
-    if not data or not data.get("buckets"):
-        send_telegram(f"📅 <b>Resumo {date_str}</b>\nNão foi possível obter dados dos buckets.")
-        last_state["last_summary_date"] = date_str
-        save_state()
-        return
+    protocol_blocks = 0
+    local_participation = 0
+    if data and data.get("buckets"):
+        totals = data["buckets"][0].get("totals", {})
+        protocol_blocks = int(totals.get("lithos.blocks", 0) or 0)
+        local_participation = int(totals.get("rollup.submission.localCount", 0) or 0)
 
-    totals = data["buckets"][0].get("totals", {})
-    protocol_blocks = int(totals.get("lithos.blocks", 0) or 0)
-    local_participation = int(totals.get("rollup.submission.localCount", 0) or 0)
     missed = max(0, protocol_blocks - local_participation)
+    score_stats = get_rollup_score_stats()
 
     msg = (
         f"📊 <b>Resumo diário — {date_str} (UTC)</b>\n\n"
         f"⛏️ Blocos minerados pelo protocolo: <b>{protocol_blocks}</b>\n"
         f"🎯 Blocos em que o pool participou: <b>{local_participation}</b>\n"
-        f"❌ Blocos em que ficou de fora: <b>{missed}</b>"
+        f"❌ Blocos em que ficou de fora: <b>{missed}</b>\n"
     )
-    send_telegram(msg)
-    log.info(f"Resumo enviado: protocolo={protocol_blocks}, local={local_participation}")
+    if score_stats.get("count", 0) > 0:
+        msg += (
+            f"\n📈 <b>RollupScore (últimas 24h, {score_stats['count']} blocos)</b>\n"
+            f"(pagamentos + evaluation)\n"
+            f"Média: <b>{score_stats['mean']:,}</b>\n"
+            f"Mediana: <b>{score_stats['median']:,}</b>\n"
+            f"Min / Max: {score_stats['min']:,} / {score_stats['max']:,}"
+        )
+    else:
+        msg += "\n📈 Sem dados de rollupScore nas últimas 24h."
 
+    send_telegram(msg)
     last_state["last_summary_date"] = date_str
     save_state()
 
@@ -223,8 +285,8 @@ def main():
 
     load_state()
 
-    log.info("Iniciando monitor Lithos (total protocolo + participação por heights)")
-    send_telegram("🟢 <b>Monitor Lithos iniciado</b>\nTotal protocolo (buckets) + participação (heights)")
+    log.info("Iniciando monitor Lithos")
+    send_telegram("🟢 <b>Monitor Lithos iniciado</b>")
 
     while True:
         try:
@@ -251,13 +313,15 @@ def main():
             required = nisp["required"]
             blocks = nisp["blocks_remaining"]
             block_candidates = nisp["block_candidates"]
+            sol_accepted = nisp["solutions_accepted"]
+            sol_rejected = nisp["solutions_rejected"]
             is_ready = nisp_count >= required
             is_critical = blocks < BLOCKS_CRITICAL
 
             log.info(
                 f"NISP | count={nisp_count}/{required} | ready={is_ready} | "
                 f"blocks={blocks} | candidates={block_candidates} | "
-                f"participated={len(last_state['seen_heights'])}"
+                f"accepted={sol_accepted} rejected={sol_rejected}"
             )
 
             alerts = []
@@ -279,6 +343,8 @@ def main():
                 last_state["nisp_count"] = nisp_count
                 last_state["critical"] = is_critical
                 last_state["block_candidates"] = block_candidates
+                last_state["solutions_accepted"] = sol_accepted
+                last_state["solutions_rejected"] = sol_rejected
 
             else:
                 prev_count = last_state["nisp_count"]
@@ -311,19 +377,42 @@ def main():
                         f"Super shares: {nisp_count}/{required}"
                     )
 
-                if last_state["block_candidates"] is not None and block_candidates > last_state["block_candidates"]:
-                    delta = block_candidates - last_state["block_candidates"]
-                    alerts.append(
-                        f"🎯 <b>BLOCK CANDIDATE ENCONTRADO</b>\n"
-                        f"Novos candidatos: <b>{delta}</b>\n"
-                        f"Total nesta sessão: {block_candidates}"
-                    )
+                # Block candidates / solutions
+                if last_state["block_candidates"] is not None:
+                    if block_candidates > last_state["block_candidates"]:
+                        delta_cand = block_candidates - last_state["block_candidates"]
+                        accepted_delta = sol_accepted - (last_state["solutions_accepted"] or 0)
+                        rejected_delta = sol_rejected - (last_state["solutions_rejected"] or 0)
 
-            # --- Participação via heights novas em /blocks/all ---
+                        if accepted_delta > 0:
+                            alerts.append(
+                                f"🎯 <b>BLOCK CANDIDATE ACEITO</b>\n"
+                                f"Novos candidatos: <b>{delta_cand}</b>\n"
+                                f"Soluções aceitas: +{accepted_delta}\n"
+                                f"Total aceitas nesta sessão: {sol_accepted}"
+                            )
+                        if rejected_delta > 0:
+                            alerts.append(
+                                f"❌ <b>BLOCK CANDIDATE REJEITADO</b>\n"
+                                f"Candidato minerado mas rejeitado: <b>{rejected_delta}</b>\n"
+                                f"Total rejeitadas nesta sessão: {sol_rejected}"
+                            )
+                        if accepted_delta == 0 and rejected_delta == 0:
+                            alerts.append(
+                                f"🎯 <b>BLOCK CANDIDATE ENCONTRADO</b>\n"
+                                f"Novos candidatos: <b>{delta_cand}</b>\n"
+                                f"Aguardando confirmação de aceitação"
+                            )
+
+                last_state["solutions_accepted"] = sol_accepted
+                last_state["solutions_rejected"] = sol_rejected
+
+            # --- Participação via heights (só heights maiores que o max anterior) ---
             pool_blocks = get_pool_blocks()
             if pool_blocks:
                 current_heights = {b.get("blockHeight") for b in pool_blocks if b.get("blockHeight")}
-                new_heights = current_heights - last_state["seen_heights"]
+                prev_max = last_state["max_block_height"] or 0
+                new_heights = {h for h in current_heights if h > prev_max and h not in last_state["seen_heights"]}
 
                 if new_heights:
                     official_daily = get_official_daily_blocks()
@@ -343,6 +432,7 @@ def main():
 
                 if current_heights:
                     last_state["max_block_height"] = max(current_heights)
+                    save_state()
 
             for msg in alerts:
                 log.info(f"Enviando alerta: {msg[:80]}...")
