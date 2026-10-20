@@ -4,7 +4,7 @@ Monitor Lithos NISP + NiceHash marketplace
 - Total protocolo + participação por heights
 - Block candidates (aceito/rejeitado)
 - Resumo diário com rollupScore
-- Monitor de preço NiceHash (subir/baixar)
+- Monitor de preço NiceHash (subir/baixar) com fix do top_other
 """
 
 import os
@@ -34,9 +34,9 @@ NISP_REQUIRED = int(os.getenv("NISP_REQUIRED", "10"))
 # NiceHash
 NICEHASH_ORDER_ID = os.getenv("NICEHASH_ORDER_ID", "").strip()
 NICEHASH_ALGORITHM = os.getenv("NICEHASH_ALGORITHM", "AUTOLYKOS")
-NICEHASH_MARKET = os.getenv("NICEHASH_MARKET", "BTC")  # BTC ou USDT
-PRICE_DECREASE_COOLDOWN = int(os.getenv("PRICE_DECREASE_COOLDOWN", "600"))  # 10 min
-PRICE_DROP_THRESHOLD = float(os.getenv("PRICE_DROP_THRESHOLD", "0.0005"))  # diferença para sugerir baixa
+NICEHASH_MARKET = os.getenv("NICEHASH_MARKET", "BTC")
+PRICE_DECREASE_COOLDOWN = int(os.getenv("PRICE_DECREASE_COOLDOWN", "600"))
+PRICE_DROP_THRESHOLD = float(os.getenv("PRICE_DROP_THRESHOLD", "0.0005"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -323,16 +323,21 @@ def monitor_nicehash_price():
     my_rigs = int(my_order.get("rigsCount", 0))
     my_speed = float(my_order.get("acceptedSpeed", 0))
 
-    # Ordens ativas com preço mais alto
+    # Ordens ativas com preço mais alto (excluindo a própria)
     higher_active = [
         o for o in orders
-        if float(o.get("price", 0)) > my_price
+        if o.get("id") != NICEHASH_ORDER_ID
+        and float(o.get("price", 0)) > my_price
         and int(o.get("rigsCount", 0)) > 0
         and float(o.get("acceptedSpeed", 0)) > 0.0001
     ]
 
-    # Melhor preço ativo acima (ou o topo)
-    top_price = max((float(o["price"]) for o in orders if int(o.get("rigsCount", 0)) > 0), default=my_price)
+    # Maior preço ativo de *outras* ordens
+    other_active_prices = [
+        float(o["price"]) for o in orders
+        if o.get("id") != NICEHASH_ORDER_ID and int(o.get("rigsCount", 0)) > 0
+    ]
+    top_other = max(other_active_prices, default=0)
 
     alerts = []
 
@@ -347,15 +352,15 @@ def monitor_nicehash_price():
             f"Rigs suas: {my_rigs} | Speed: {my_speed:.6f}"
         )
 
-    # Preço pode baixar (topo do book caiu bastante e cooldown ok)
+    # Preço pode baixar (outras ordens estão bem abaixo e cooldown ok)
     now = time.time()
     if (now - last_state["last_price_decrease_alert"]) >= PRICE_DECREASE_COOLDOWN:
-        if top_price < my_price - PRICE_DROP_THRESHOLD and my_rigs > 0:
+        if top_other > 0 and my_price > top_other + PRICE_DROP_THRESHOLD and my_rigs > 0:
             alerts.append(
                 f"📉 <b>PODE BAIXAR PREÇO NICEHASH</b>\n"
                 f"Seu preço: {my_price:.4f}\n"
-                f"Topo atual do book: {top_price:.4f}\n"
-                f"Diferença: {my_price - top_price:.4f}\n"
+                f"Próxima ordem ativa: {top_other:.4f}\n"
+                f"Diferença: {my_price - top_other:.4f}\n"
                 f"Cooldown de baixa: ok\n"
                 f"Rigs: {my_rigs} | Speed: {my_speed:.6f}"
             )
