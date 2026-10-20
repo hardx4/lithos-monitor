@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Monitor Lithos NISP + novos blocos + block candidates
-- Total protocolo: lithos.blocks (buckets)
-- Participação: heights novas e recentes em /blocks/all
-- Block candidates: verifica aceitação/rejeição
-- Resumo diário com média/mediana de rollupScore (pagamentos + evaluation)
+Monitor Lithos NISP + NiceHash marketplace
+- Total protocolo + participação por heights
+- Block candidates (aceito/rejeitado)
+- Resumo diário com rollupScore
+- Monitor de preço NiceHash (subir/baixar)
 """
 
 import os
@@ -31,6 +31,13 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 BLOCKS_CRITICAL = int(os.getenv("BLOCKS_CRITICAL", "15"))
 NISP_REQUIRED = int(os.getenv("NISP_REQUIRED", "10"))
 
+# NiceHash
+NICEHASH_ORDER_ID = os.getenv("NICEHASH_ORDER_ID", "").strip()
+NICEHASH_ALGORITHM = os.getenv("NICEHASH_ALGORITHM", "AUTOLYKOS")
+NICEHASH_MARKET = os.getenv("NICEHASH_MARKET", "BTC")  # BTC ou USDT
+PRICE_DECREASE_COOLDOWN = int(os.getenv("PRICE_DECREASE_COOLDOWN", "600"))  # 10 min
+PRICE_DROP_THRESHOLD = float(os.getenv("PRICE_DROP_THRESHOLD", "0.0005"))  # diferença para sugerir baixa
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
@@ -41,7 +48,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("lithos-monitor")
+log = logging.getLogger("lithos-manager")
 
 last_state = {
     "nisp_count": None,
@@ -55,6 +62,7 @@ last_state = {
     "initialized": False,
     "last_summary_date": None,
     "last_official_daily": 0,
+    "last_price_decrease_alert": 0,
 }
 
 # ==================== PERSISTÊNCIA ====================
@@ -71,10 +79,12 @@ def load_state():
             last_state["seen_heights"] = set(data.get("seen_heights", []))
             last_state["last_summary_date"] = data.get("last_summary_date")
             last_state["last_official_daily"] = data.get("last_official_daily", 0)
+            last_state["last_price_decrease_alert"] = data.get("last_price_decrease_alert", 0)
             log.info(f"Estado carregado. Heights vistas hoje: {len(last_state['seen_heights'])}")
         else:
             log.info("Arquivo de estado é de outro dia. Set de heights zerado.")
             last_state["last_summary_date"] = data.get("last_summary_date")
+            last_state["last_price_decrease_alert"] = data.get("last_price_decrease_alert", 0)
     except Exception as e:
         log.warning(f"Não foi possível carregar estado: {e}")
 
@@ -86,6 +96,7 @@ def save_state():
             "seen_heights": list(last_state["seen_heights"]),
             "last_summary_date": last_state["last_summary_date"],
             "last_official_daily": last_state["last_official_daily"],
+            "last_price_decrease_alert": last_state["last_price_decrease_alert"],
         }
         STATE_FILE.write_text(json.dumps(data))
     except Exception as e:
@@ -199,16 +210,13 @@ def should_send_daily_summary() -> bool:
     return False
 
 def get_rollup_score_stats() -> Dict[str, Any]:
-    """Média e mediana do rollupScore dos pagamentos + claims em evaluation das últimas 24h."""
     data = get_payments()
     if not data:
         return {}
-    
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     day_ago_ms = now_ms - 86400000
     scores = []
 
-    # Pagamentos confirmados
     for p in data.get("payments", []):
         ts = p.get("timestamp") or p.get("minedTimestamp") or 0
         if ts >= day_ago_ms and p.get("rollupScore"):
@@ -217,7 +225,6 @@ def get_rollup_score_stats() -> Dict[str, Any]:
             except (ValueError, TypeError):
                 pass
 
-    # Claims em evaluation
     for c in data.get("claims", []):
         if c.get("phase") != "evaluation":
             continue
@@ -279,14 +286,94 @@ def send_daily_summary():
     last_state["last_summary_date"] = date_str
     save_state()
 
+# ==================== NICEHASH MARKETPLACE ====================
+def get_nicehash_orderbook() -> Optional[Dict]:
+    url = "https://api2.nicehash.com/main/api/v2/hashpower/orderBook"
+    params = {"algorithm": NICEHASH_ALGORITHM, "size": 50}
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        stats = data.get("stats", {}).get(NICEHASH_MARKET)
+        return stats
+    except Exception as e:
+        log.error(f"Erro ao consultar NiceHash orderBook: {e}")
+        return None
+
+def monitor_nicehash_price():
+    if not NICEHASH_ORDER_ID:
+        return
+
+    book = get_nicehash_orderbook()
+    if not book or not book.get("orders"):
+        return
+
+    orders = book["orders"]
+    my_order = None
+    for o in orders:
+        if o.get("id") == NICEHASH_ORDER_ID:
+            my_order = o
+            break
+
+    if not my_order:
+        log.warning(f"Ordem {NICEHASH_ORDER_ID} não encontrada no book")
+        return
+
+    my_price = float(my_order.get("price", 0))
+    my_rigs = int(my_order.get("rigsCount", 0))
+    my_speed = float(my_order.get("acceptedSpeed", 0))
+
+    # Ordens ativas com preço mais alto
+    higher_active = [
+        o for o in orders
+        if float(o.get("price", 0)) > my_price
+        and int(o.get("rigsCount", 0)) > 0
+        and float(o.get("acceptedSpeed", 0)) > 0.0001
+    ]
+
+    # Melhor preço ativo acima (ou o topo)
+    top_price = max((float(o["price"]) for o in orders if int(o.get("rigsCount", 0)) > 0), default=my_price)
+
+    alerts = []
+
+    # Sem mineradores e existem ordens mais caras ativas → subir preço
+    if my_rigs == 0 and my_speed < 0.0001 and higher_active:
+        top_higher = max(float(o["price"]) for o in higher_active)
+        alerts.append(
+            f"📈 <b>SUBIR PREÇO NICEHASH</b>\n"
+            f"Sua ordem está sem mineradores\n"
+            f"Preço atual: {my_price:.4f}\n"
+            f"Ordens mais altas ativas: até {top_higher:.4f}\n"
+            f"Rigs suas: {my_rigs} | Speed: {my_speed:.6f}"
+        )
+
+    # Preço pode baixar (topo do book caiu bastante e cooldown ok)
+    now = time.time()
+    if (now - last_state["last_price_decrease_alert"]) >= PRICE_DECREASE_COOLDOWN:
+        if top_price < my_price - PRICE_DROP_THRESHOLD and my_rigs > 0:
+            alerts.append(
+                f"📉 <b>PODE BAIXAR PREÇO NICEHASH</b>\n"
+                f"Seu preço: {my_price:.4f}\n"
+                f"Topo atual do book: {top_price:.4f}\n"
+                f"Diferença: {my_price - top_price:.4f}\n"
+                f"Cooldown de baixa: ok\n"
+                f"Rigs: {my_rigs} | Speed: {my_speed:.6f}"
+            )
+            last_state["last_price_decrease_alert"] = now
+            save_state()
+
+    for msg in alerts:
+        log.info(f"NiceHash alert: {msg[:80]}")
+        send_telegram(msg)
+
 # ==================== LOOP ====================
 def main():
     global last_state
 
     load_state()
 
-    log.info("Iniciando monitor Lithos")
-    send_telegram("🟢 <b>Monitor Lithos iniciado</b>")
+    log.info("Iniciando monitor Lithos + NiceHash")
+    send_telegram("🟢 <b>Monitor Lithos + NiceHash iniciado</b>")
 
     while True:
         try:
@@ -377,7 +464,6 @@ def main():
                         f"Super shares: {nisp_count}/{required}"
                     )
 
-                # Block candidates / solutions
                 if last_state["block_candidates"] is not None:
                     if block_candidates > last_state["block_candidates"]:
                         delta_cand = block_candidates - last_state["block_candidates"]
@@ -407,7 +493,7 @@ def main():
                 last_state["solutions_accepted"] = sol_accepted
                 last_state["solutions_rejected"] = sol_rejected
 
-            # --- Participação via heights (só heights maiores que o max anterior) ---
+            # Participação via heights
             pool_blocks = get_pool_blocks()
             if pool_blocks:
                 current_heights = {b.get("blockHeight") for b in pool_blocks if b.get("blockHeight")}
@@ -441,6 +527,9 @@ def main():
             last_state["nisp_count"] = nisp_count
             last_state["critical"] = is_critical
             last_state["block_candidates"] = block_candidates
+
+            # NiceHash price monitor
+            monitor_nicehash_price()
 
         except Exception as e:
             log.exception(f"Erro no ciclo: {e}")
