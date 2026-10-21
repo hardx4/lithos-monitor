@@ -2,13 +2,10 @@
 """
 Monitor Lithos NISP + NiceHash marketplace
 - Alertas de blocos <15, <10 e <5
-- Novas heights de /blocks/all
-- Contagem oficial de participação via /stats/mining/buckets (localCount)
-- Deduplicação com /stats/mining/payments?limit=500
-- Cache local com fallback apenas em falha de API
+- Total protocolo + participação por heights
 - Block candidates (aceito/rejeitado)
 - Resumo diário com rollupScore
-- Monitor de preço NiceHash (subir com cooldown 1h / baixar com 10 min)
+- Monitor de preço NiceHash (subir/baixar)
 """
 
 import os
@@ -68,9 +65,7 @@ last_state = {
     "initialized": False,
     "last_summary_date": None,
     "last_official_daily": 0,
-    "last_local_count": 0,
     "last_price_decrease_alert": 0,
-    "last_price_increase_alert": 0,
 }
 
 # ==================== PERSISTÊNCIA ====================
@@ -87,16 +82,12 @@ def load_state():
             last_state["seen_heights"] = set(data.get("seen_heights", []))
             last_state["last_summary_date"] = data.get("last_summary_date")
             last_state["last_official_daily"] = data.get("last_official_daily", 0)
-            last_state["last_local_count"] = data.get("last_local_count", 0)
             last_state["last_price_decrease_alert"] = data.get("last_price_decrease_alert", 0)
-            last_state["last_price_increase_alert"] = data.get("last_price_increase_alert", 0)
             log.info(f"Estado carregado. Heights vistas hoje: {len(last_state['seen_heights'])}")
         else:
             log.info("Arquivo de estado é de outro dia. Set de heights zerado.")
             last_state["last_summary_date"] = data.get("last_summary_date")
             last_state["last_price_decrease_alert"] = data.get("last_price_decrease_alert", 0)
-            last_state["last_price_increase_alert"] = data.get("last_price_increase_alert", 0)
-            last_state["last_local_count"] = 0
     except Exception as e:
         log.warning(f"Não foi possível carregar estado: {e}")
 
@@ -108,9 +99,7 @@ def save_state():
             "seen_heights": list(last_state["seen_heights"]),
             "last_summary_date": last_state["last_summary_date"],
             "last_official_daily": last_state["last_official_daily"],
-            "last_local_count": last_state["last_local_count"],
             "last_price_decrease_alert": last_state["last_price_decrease_alert"],
-            "last_price_increase_alert": last_state["last_price_increase_alert"],
         }
         STATE_FILE.write_text(json.dumps(data))
     except Exception as e:
@@ -184,11 +173,10 @@ def get_mining_buckets(from_ms: int, until_ms: int, interval: str = "day") -> Op
         log.error(f"Erro ao consultar /stats/mining/buckets: {e}")
         return None
 
-def get_payments(limit: int = 500) -> Optional[Dict]:
+def get_payments() -> Optional[Dict]:
     url = f"{LITHOS_BASE}/stats/mining/payments"
-    params = {"limit": limit}
     try:
-        resp = requests.get(url, headers=_headers(), params=params, timeout=15, verify=False)
+        resp = requests.get(url, headers=_headers(), timeout=15, verify=False)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -203,42 +191,18 @@ def get_utc_midnight(days_ago: int = 0) -> datetime:
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight - timedelta(days=days_ago)
 
-def get_official_daily_counts() -> Dict[str, int]:
-    """Retorna protocol e localCount oficiais do dia. Usa cache só em falha."""
+def get_official_daily_blocks() -> int:
     today_midnight = get_utc_midnight(0)
     next_midnight = today_midnight + timedelta(days=1)
     from_ms = int(today_midnight.timestamp() * 1000)
     until_ms = int(next_midnight.timestamp() * 1000)
     data = get_mining_buckets(from_ms, until_ms, "day")
-    if data and data.get("buckets"):
-        totals = data["buckets"][0].get("totals", {})
-        protocol = int(totals.get("lithos.blocks", 0) or 0)
-        local = int(totals.get("rollup.submission.localCount", 0) or 0)
-        if protocol >= last_state["last_official_daily"] or local >= last_state["last_local_count"]:
-            last_state["last_official_daily"] = protocol
-            last_state["last_local_count"] = local
-            save_state()
-        return {"protocol": protocol, "local": local}
-    return {
-        "protocol": last_state["last_official_daily"],
-        "local": last_state["last_local_count"],
-    }
-
-def get_payment_heights() -> Set[int]:
-    """Heights já consolidadas em payments + claims (para deduplicação)."""
-    data = get_payments(limit=500)
-    if not data:
-        return set()
-    heights = set()
-    for p in data.get("payments", []):
-        h = p.get("minedHeight")
-        if h:
-            heights.add(h)
-    for c in data.get("claims", []):
-        h = c.get("minedHeight")
-        if h:
-            heights.add(h)
-    return heights
+    if not data or not data.get("buckets"):
+        return last_state["last_official_daily"]
+    totals = data["buckets"][0].get("totals", {})
+    count = int(totals.get("lithos.blocks", 0) or 0)
+    last_state["last_official_daily"] = count
+    return count
 
 def should_send_daily_summary() -> bool:
     now = datetime.now(timezone.utc)
@@ -377,23 +341,18 @@ def monitor_nicehash_price():
     top_other = max(other_active_prices, default=0)
 
     alerts = []
-    now = time.time()
 
-    # SUBIR PREÇO — cooldown de 1 hora se a situação não mudar
     if my_rigs == 0 and my_speed < 0.0001 and higher_active:
-        if (now - last_state["last_price_increase_alert"]) >= 3600:
-            top_higher = max(float(o["price"]) for o in higher_active)
-            alerts.append(
-                f"📈 <b>SUBIR PREÇO NICEHASH</b>\n"
-                f"Sua ordem está sem mineradores\n"
-                f"Preço atual: {my_price:.4f}\n"
-                f"Ordens mais altas ativas: até {top_higher:.4f}\n"
-                f"Rigs suas: {my_rigs} | Speed: {my_speed:.6f}"
-            )
-            last_state["last_price_increase_alert"] = now
-            save_state()
+        top_higher = max(float(o["price"]) for o in higher_active)
+        alerts.append(
+            f"📈 <b>SUBIR PREÇO NICEHASH</b>\n"
+            f"Sua ordem está sem mineradores\n"
+            f"Preço atual: {my_price:.4f}\n"
+            f"Ordens mais altas ativas: até {top_higher:.4f}\n"
+            f"Rigs suas: {my_rigs} | Speed: {my_speed:.6f}"
+        )
 
-    # BAIXAR PREÇO — cooldown de 10 min
+    now = time.time()
     if (now - last_state["last_price_decrease_alert"]) >= PRICE_DECREASE_COOLDOWN:
         if top_other > 0 and my_price > top_other + PRICE_DROP_THRESHOLD and my_rigs > 0:
             alerts.append(
@@ -433,7 +392,6 @@ def main():
                 last_state["current_utc_date"] = today_utc
                 last_state["seen_heights"] = set()
                 last_state["last_official_daily"] = 0
-                last_state["last_local_count"] = 0
                 save_state()
 
             nisp = get_nisp_status()
@@ -512,6 +470,7 @@ def main():
                         f"Super shares: {nisp_count}/{required}"
                     )
 
+                # Alertas específicos <10 e <5
                 if last_state["critical_10"] is not True and blocks < 10:
                     alerts.append(
                         f"⚠️ <b>BLOCOS ABAIXO DE 10</b>\n"
@@ -565,34 +524,28 @@ def main():
                 last_state["solutions_accepted"] = sol_accepted
                 last_state["solutions_rejected"] = sol_rejected
 
-            # --- Novos blocos ---
+            # Participação via heights
             pool_blocks = get_pool_blocks()
             if pool_blocks:
                 current_heights = {b.get("blockHeight") for b in pool_blocks if b.get("blockHeight")}
                 prev_max = last_state["max_block_height"] or 0
-                raw_new = {h for h in current_heights if h > prev_max and h not in last_state["seen_heights"]}
+                new_heights = {h for h in current_heights if h > prev_max and h not in last_state["seen_heights"]}
 
-                if raw_new:
-                    payment_heights = get_payment_heights()
-                    new_heights = raw_new - payment_heights
-
-                    counts = get_official_daily_counts()
-                    official_protocol = counts["protocol"]
-                    official_local = counts["local"]
-
-                    last_state["seen_heights"].update(raw_new)
+                if new_heights:
+                    official_daily = get_official_daily_blocks()
+                    last_state["seen_heights"].update(new_heights)
+                    participated = len(last_state["seen_heights"])
                     save_state()
 
-                    if new_heights:
-                        heights_list = ", ".join(str(h) for h in sorted(new_heights))
-                        alerts.append(
-                            f"⛏️ <b>NOVOS BLOCOS NO POOL</b>\n"
-                            f"Novos nesta checagem: <b>{len(new_heights)}</b>\n"
-                            f"Heights: <code>{heights_list}</code>\n"
-                            f"Protocolo hoje: <b>{official_protocol}</b>\n"
-                            f"Pool participou: <b>{official_local}</b>\n"
-                            f"Ficou de fora: <b>{max(0, official_protocol - official_local)}</b>"
-                        )
+                    heights_list = ", ".join(str(h) for h in sorted(new_heights))
+                    alerts.append(
+                        f"⛏️ <b>NOVOS BLOCOS NO POOL</b>\n"
+                        f"Novos nesta checagem: <b>{len(new_heights)}</b>\n"
+                        f"Heights: <code>{heights_list}</code>\n"
+                        f"Protocolo hoje: <b>{official_daily}</b>\n"
+                        f"Pool participou: <b>{participated}</b>\n"
+                        f"Ficou de fora: <b>{max(0, official_daily - participated)}</b>"
+                    )
 
                 if current_heights:
                     last_state["max_block_height"] = max(current_heights)
@@ -606,6 +559,7 @@ def main():
             last_state["critical"] = is_critical
             last_state["block_candidates"] = block_candidates
 
+            # NiceHash price monitor
             monitor_nicehash_price()
 
         except Exception as e:
