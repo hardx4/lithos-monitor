@@ -616,8 +616,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-O que mudou nesta versão
-Alerta SUBIR PREÇO NICEHASH agora tem cooldown de 1 hora.
-Só reenvia se a condição (ordem sem mineradores + ordens mais altas ativas) persistir e o cooldown tiver passado.
-O estado last_price_increase_alert é persistido no arquivo.
-Alerta de baixar preço continua com cooldown de 10 minutos.
