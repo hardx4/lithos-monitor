@@ -154,8 +154,9 @@ def get_nisp_status() -> Optional[Dict[str, Any]]:
 
 def get_pool_blocks() -> Optional[List[Dict[str, Any]]]:
     url = f"{LITHOS_BASE}/blocks/all"
+    params = {"limit": 100}
     try:
-        resp = requests.get(url, headers=_headers(), timeout=10, verify=False)
+        resp = requests.get(url, headers=_headers(), params=params, timeout=10, verify=False)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
