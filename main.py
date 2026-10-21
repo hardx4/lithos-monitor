@@ -8,7 +8,7 @@ Monitor Lithos NISP + NiceHash marketplace
 - Cache local com fallback apenas em falha de API
 - Block candidates (aceito/rejeitado)
 - Resumo diário com rollupScore
-- Monitor de preço NiceHash (subir/baixar)
+- Monitor de preço NiceHash (subir com cooldown 1h / baixar com 10 min)
 """
 
 import os
@@ -70,6 +70,7 @@ last_state = {
     "last_official_daily": 0,
     "last_local_count": 0,
     "last_price_decrease_alert": 0,
+    "last_price_increase_alert": 0,
 }
 
 # ==================== PERSISTÊNCIA ====================
@@ -88,11 +89,13 @@ def load_state():
             last_state["last_official_daily"] = data.get("last_official_daily", 0)
             last_state["last_local_count"] = data.get("last_local_count", 0)
             last_state["last_price_decrease_alert"] = data.get("last_price_decrease_alert", 0)
+            last_state["last_price_increase_alert"] = data.get("last_price_increase_alert", 0)
             log.info(f"Estado carregado. Heights vistas hoje: {len(last_state['seen_heights'])}")
         else:
             log.info("Arquivo de estado é de outro dia. Set de heights zerado.")
             last_state["last_summary_date"] = data.get("last_summary_date")
             last_state["last_price_decrease_alert"] = data.get("last_price_decrease_alert", 0)
+            last_state["last_price_increase_alert"] = data.get("last_price_increase_alert", 0)
             last_state["last_local_count"] = 0
     except Exception as e:
         log.warning(f"Não foi possível carregar estado: {e}")
@@ -107,6 +110,7 @@ def save_state():
             "last_official_daily": last_state["last_official_daily"],
             "last_local_count": last_state["last_local_count"],
             "last_price_decrease_alert": last_state["last_price_decrease_alert"],
+            "last_price_increase_alert": last_state["last_price_increase_alert"],
         }
         STATE_FILE.write_text(json.dumps(data))
     except Exception as e:
@@ -210,13 +214,11 @@ def get_official_daily_counts() -> Dict[str, int]:
         totals = data["buckets"][0].get("totals", {})
         protocol = int(totals.get("lithos.blocks", 0) or 0)
         local = int(totals.get("rollup.submission.localCount", 0) or 0)
-        # Atualiza cache se os dados da API forem mais recentes
         if protocol >= last_state["last_official_daily"] or local >= last_state["last_local_count"]:
             last_state["last_official_daily"] = protocol
             last_state["last_local_count"] = local
             save_state()
         return {"protocol": protocol, "local": local}
-    # Fallback para cache
     return {
         "protocol": last_state["last_official_daily"],
         "local": last_state["last_local_count"],
@@ -375,18 +377,23 @@ def monitor_nicehash_price():
     top_other = max(other_active_prices, default=0)
 
     alerts = []
-
-    if my_rigs == 0 and my_speed < 0.0001 and higher_active:
-        top_higher = max(float(o["price"]) for o in higher_active)
-        alerts.append(
-            f"📈 <b>SUBIR PREÇO NICEHASH</b>\n"
-            f"Sua ordem está sem mineradores\n"
-            f"Preço atual: {my_price:.4f}\n"
-            f"Ordens mais altas ativas: até {top_higher:.4f}\n"
-            f"Rigs suas: {my_rigs} | Speed: {my_speed:.6f}"
-        )
-
     now = time.time()
+
+    # SUBIR PREÇO — cooldown de 1 hora se a situação não mudar
+    if my_rigs == 0 and my_speed < 0.0001 and higher_active:
+        if (now - last_state["last_price_increase_alert"]) >= 3600:
+            top_higher = max(float(o["price"]) for o in higher_active)
+            alerts.append(
+                f"📈 <b>SUBIR PREÇO NICEHASH</b>\n"
+                f"Sua ordem está sem mineradores\n"
+                f"Preço atual: {my_price:.4f}\n"
+                f"Ordens mais altas ativas: até {top_higher:.4f}\n"
+                f"Rigs suas: {my_rigs} | Speed: {my_speed:.6f}"
+            )
+            last_state["last_price_increase_alert"] = now
+            save_state()
+
+    # BAIXAR PREÇO — cooldown de 10 min
     if (now - last_state["last_price_decrease_alert"]) >= PRICE_DECREASE_COOLDOWN:
         if top_other > 0 and my_price > top_other + PRICE_DROP_THRESHOLD and my_rigs > 0:
             alerts.append(
@@ -505,7 +512,6 @@ def main():
                         f"Super shares: {nisp_count}/{required}"
                     )
 
-                # Alertas específicos <10 e <5
                 if last_state["critical_10"] is not True and blocks < 10:
                     alerts.append(
                         f"⚠️ <b>BLOCOS ABAIXO DE 10</b>\n"
@@ -559,7 +565,7 @@ def main():
                 last_state["solutions_accepted"] = sol_accepted
                 last_state["solutions_rejected"] = sol_rejected
 
-            # --- Novos blocos: heights de /blocks/all + contagem oficial ---
+            # --- Novos blocos ---
             pool_blocks = get_pool_blocks()
             if pool_blocks:
                 current_heights = {b.get("blockHeight") for b in pool_blocks if b.get("blockHeight")}
@@ -567,16 +573,13 @@ def main():
                 raw_new = {h for h in current_heights if h > prev_max and h not in last_state["seen_heights"]}
 
                 if raw_new:
-                    # Deduplicação: ignora heights já presentes em payments
                     payment_heights = get_payment_heights()
                     new_heights = raw_new - payment_heights
 
-                    # Contagens oficiais do dia
                     counts = get_official_daily_counts()
                     official_protocol = counts["protocol"]
                     official_local = counts["local"]
 
-                    # Atualiza seen (mesmo as que já estavam em payments, para não re-alertar)
                     last_state["seen_heights"].update(raw_new)
                     save_state()
 
@@ -603,7 +606,6 @@ def main():
             last_state["critical"] = is_critical
             last_state["block_candidates"] = block_candidates
 
-            # NiceHash price monitor
             monitor_nicehash_price()
 
         except Exception as e:
@@ -614,3 +616,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+O que mudou nesta versão
+Alerta SUBIR PREÇO NICEHASH agora tem cooldown de 1 hora.
+Só reenvia se a condição (ordem sem mineradores + ordens mais altas ativas) persistir e o cooldown tiver passado.
+O estado last_price_increase_alert é persistido no arquivo.
+Alerta de baixar preço continua com cooldown de 10 minutos.
