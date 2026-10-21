@@ -2,7 +2,10 @@
 """
 Monitor Lithos NISP + NiceHash marketplace
 - Alertas de blocos <15, <10 e <5
-- Total protocolo + participação por heights
+- Novas heights de /blocks/all
+- Contagem oficial de participação via /stats/mining/buckets (localCount)
+- Deduplicação com /stats/mining/payments?limit=500
+- Cache local com fallback apenas em falha de API
 - Block candidates (aceito/rejeitado)
 - Resumo diário com rollupScore
 - Monitor de preço NiceHash (subir/baixar)
@@ -65,6 +68,7 @@ last_state = {
     "initialized": False,
     "last_summary_date": None,
     "last_official_daily": 0,
+    "last_local_count": 0,
     "last_price_decrease_alert": 0,
 }
 
@@ -82,12 +86,14 @@ def load_state():
             last_state["seen_heights"] = set(data.get("seen_heights", []))
             last_state["last_summary_date"] = data.get("last_summary_date")
             last_state["last_official_daily"] = data.get("last_official_daily", 0)
+            last_state["last_local_count"] = data.get("last_local_count", 0)
             last_state["last_price_decrease_alert"] = data.get("last_price_decrease_alert", 0)
             log.info(f"Estado carregado. Heights vistas hoje: {len(last_state['seen_heights'])}")
         else:
             log.info("Arquivo de estado é de outro dia. Set de heights zerado.")
             last_state["last_summary_date"] = data.get("last_summary_date")
             last_state["last_price_decrease_alert"] = data.get("last_price_decrease_alert", 0)
+            last_state["last_local_count"] = 0
     except Exception as e:
         log.warning(f"Não foi possível carregar estado: {e}")
 
@@ -99,6 +105,7 @@ def save_state():
             "seen_heights": list(last_state["seen_heights"]),
             "last_summary_date": last_state["last_summary_date"],
             "last_official_daily": last_state["last_official_daily"],
+            "last_local_count": last_state["last_local_count"],
             "last_price_decrease_alert": last_state["last_price_decrease_alert"],
         }
         STATE_FILE.write_text(json.dumps(data))
@@ -173,10 +180,11 @@ def get_mining_buckets(from_ms: int, until_ms: int, interval: str = "day") -> Op
         log.error(f"Erro ao consultar /stats/mining/buckets: {e}")
         return None
 
-def get_payments() -> Optional[Dict]:
+def get_payments(limit: int = 500) -> Optional[Dict]:
     url = f"{LITHOS_BASE}/stats/mining/payments"
+    params = {"limit": limit}
     try:
-        resp = requests.get(url, headers=_headers(), timeout=15, verify=False)
+        resp = requests.get(url, headers=_headers(), params=params, timeout=15, verify=False)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
@@ -191,18 +199,44 @@ def get_utc_midnight(days_ago: int = 0) -> datetime:
     midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return midnight - timedelta(days=days_ago)
 
-def get_official_daily_blocks() -> int:
+def get_official_daily_counts() -> Dict[str, int]:
+    """Retorna protocol e localCount oficiais do dia. Usa cache só em falha."""
     today_midnight = get_utc_midnight(0)
     next_midnight = today_midnight + timedelta(days=1)
     from_ms = int(today_midnight.timestamp() * 1000)
     until_ms = int(next_midnight.timestamp() * 1000)
     data = get_mining_buckets(from_ms, until_ms, "day")
-    if not data or not data.get("buckets"):
-        return last_state["last_official_daily"]
-    totals = data["buckets"][0].get("totals", {})
-    count = int(totals.get("lithos.blocks", 0) or 0)
-    last_state["last_official_daily"] = count
-    return count
+    if data and data.get("buckets"):
+        totals = data["buckets"][0].get("totals", {})
+        protocol = int(totals.get("lithos.blocks", 0) or 0)
+        local = int(totals.get("rollup.submission.localCount", 0) or 0)
+        # Atualiza cache se os dados da API forem mais recentes
+        if protocol >= last_state["last_official_daily"] or local >= last_state["last_local_count"]:
+            last_state["last_official_daily"] = protocol
+            last_state["last_local_count"] = local
+            save_state()
+        return {"protocol": protocol, "local": local}
+    # Fallback para cache
+    return {
+        "protocol": last_state["last_official_daily"],
+        "local": last_state["last_local_count"],
+    }
+
+def get_payment_heights() -> Set[int]:
+    """Heights já consolidadas em payments + claims (para deduplicação)."""
+    data = get_payments(limit=500)
+    if not data:
+        return set()
+    heights = set()
+    for p in data.get("payments", []):
+        h = p.get("minedHeight")
+        if h:
+            heights.add(h)
+    for c in data.get("claims", []):
+        h = c.get("minedHeight")
+        if h:
+            heights.add(h)
+    return heights
 
 def should_send_daily_summary() -> bool:
     now = datetime.now(timezone.utc)
@@ -392,6 +426,7 @@ def main():
                 last_state["current_utc_date"] = today_utc
                 last_state["seen_heights"] = set()
                 last_state["last_official_daily"] = 0
+                last_state["last_local_count"] = 0
                 save_state()
 
             nisp = get_nisp_status()
@@ -524,28 +559,37 @@ def main():
                 last_state["solutions_accepted"] = sol_accepted
                 last_state["solutions_rejected"] = sol_rejected
 
-            # Participação via heights
+            # --- Novos blocos: heights de /blocks/all + contagem oficial ---
             pool_blocks = get_pool_blocks()
             if pool_blocks:
                 current_heights = {b.get("blockHeight") for b in pool_blocks if b.get("blockHeight")}
                 prev_max = last_state["max_block_height"] or 0
-                new_heights = {h for h in current_heights if h > prev_max and h not in last_state["seen_heights"]}
+                raw_new = {h for h in current_heights if h > prev_max and h not in last_state["seen_heights"]}
 
-                if new_heights:
-                    official_daily = get_official_daily_blocks()
-                    last_state["seen_heights"].update(new_heights)
-                    participated = len(last_state["seen_heights"])
+                if raw_new:
+                    # Deduplicação: ignora heights já presentes em payments
+                    payment_heights = get_payment_heights()
+                    new_heights = raw_new - payment_heights
+
+                    # Contagens oficiais do dia
+                    counts = get_official_daily_counts()
+                    official_protocol = counts["protocol"]
+                    official_local = counts["local"]
+
+                    # Atualiza seen (mesmo as que já estavam em payments, para não re-alertar)
+                    last_state["seen_heights"].update(raw_new)
                     save_state()
 
-                    heights_list = ", ".join(str(h) for h in sorted(new_heights))
-                    alerts.append(
-                        f"⛏️ <b>NOVOS BLOCOS NO POOL</b>\n"
-                        f"Novos nesta checagem: <b>{len(new_heights)}</b>\n"
-                        f"Heights: <code>{heights_list}</code>\n"
-                        f"Protocolo hoje: <b>{official_daily}</b>\n"
-                        f"Pool participou: <b>{participated}</b>\n"
-                        f"Ficou de fora: <b>{max(0, official_daily - participated)}</b>"
-                    )
+                    if new_heights:
+                        heights_list = ", ".join(str(h) for h in sorted(new_heights))
+                        alerts.append(
+                            f"⛏️ <b>NOVOS BLOCOS NO POOL</b>\n"
+                            f"Novos nesta checagem: <b>{len(new_heights)}</b>\n"
+                            f"Heights: <code>{heights_list}</code>\n"
+                            f"Protocolo hoje: <b>{official_protocol}</b>\n"
+                            f"Pool participou: <b>{official_local}</b>\n"
+                            f"Ficou de fora: <b>{max(0, official_protocol - official_local)}</b>"
+                        )
 
                 if current_heights:
                     last_state["max_block_height"] = max(current_heights)
